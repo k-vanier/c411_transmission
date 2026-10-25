@@ -1,0 +1,26 @@
+{
+  "machine": "machine1",
+  "host": "localhost",
+  "port": 9091,
+  "username": "transmission",
+  "password": "changeme",
+
+  "c411_apikey": "YOUR_C411_API_KEY",
+  "c411_cat": "2000",
+  "max_torrent_gb": 50,
+  "max_seeders": 5,
+
+  "base_dir": "/root/scripts",
+  "watch_dir": "/data/watch",
+  "download_dir": "/data/downloads",
+
+  "min_free_gb": 30,
+  "space_check_path": "/data",
+
+  "dry_run_default": false,
+  "victim_policy": "ratio",
+  "add_policy": "max_downloads",
+  "max_downloads": 3,
+  "start_timeout_min": 15,
+  "stall_minutes_default": 10
+}
