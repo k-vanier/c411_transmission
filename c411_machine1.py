@@ -500,8 +500,9 @@ def _torrent_matches(t, name):
 
 
 def _torrent_started(t):
+    # démarré = a reçu des données ; le statut Téléchargement seul ne suffit pas (0 octet possible)
     return (
-        t.get('status') in DOWNLOADING_STATUS
+        (t.get('haveValid') or 0) + (t.get('haveUnchecked') or 0) > 0
         or (t.get('percentDone') or 0) > 0
         or (t.get('downloadedEver') or 0) > 0
         or (t.get('rateDownload') or 0) > 0
