@@ -65,7 +65,8 @@ SPACE_CHECK_PATH = Path('/')
 # Comportement
 DRY_RUN_DEFAULT = False         # True = suppressions simulées sauf avec --force-delete
 VICTIM_POLICY = 'ratio'         # 'ratio' : terminé au plus faible ratio | 'oldest' : inactif depuis le plus longtemps
-ADD_POLICY = 'all_finished'     # 'all_finished' : tous terminés | 'no_download' : aucun DL en cours
+ADD_POLICY = 'max_downloads'    # 'max_downloads' : moins de MAX_DOWNLOADS en cours | 'all_finished' : tous terminés | 'no_download' : aucun DL en cours
+MAX_DOWNLOADS = 3               # téléchargements simultanés max (ADD_POLICY = 'max_downloads')
 START_TIMEOUT_MIN = 15          # supprime un ajout qui n'a pas démarré après N min, None = désactivé
 STALL_MINUTES_DEFAULT = 10      # valeur de --rm-stalled sans argument
 
@@ -478,11 +479,12 @@ def print_session_report(session, stats, free_space_info, dry_run, args):
 # SURVEILLANCE DÉMARRAGE DES TORRENTS AJOUTÉS (START_TIMEOUT_MIN)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def register_pending(c411_id, name, torrent_file):
+def register_pending(c411_id, name, size, torrent_file):
     pending = [p for p in read_json(OUTPUT_PENDING, []) if p.get('c411_id') != c411_id]
     pending.append({
         'c411_id': c411_id,
         'name': name,
+        'size': size,
         'torrent_file': str(torrent_file) if torrent_file else None,
         'added_at': int(time.time())
     })
@@ -889,20 +891,56 @@ def rm_all_torrents(trans, torrents, dry_run):
 # AJOUT D'UN TORRENT C411
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def can_add(torrents):
+def waiting_pending(torrents):
+    # .torrent déposés dans WATCH_DIR mais pas encore vus dans Transmission
+    return [
+        p for p in read_json(OUTPUT_PENDING, [])
+        if not any(_torrent_matches(t, p.get('name')) for t in torrents)
+    ]
+
+
+def free_slots(torrents):
+    """Nombre de torrents qu'on peut ajouter maintenant selon ADD_POLICY."""
     if ADD_POLICY == 'all_finished':
         # une liste vide compte comme terminée : on peut injecter un nouveau torrent
-        if not all(is_done(t) for t in torrents):
+        if not all(is_done(t) for t in torrents) or waiting_pending(torrents):
             print("\033[1;33m>> Tous les torrents ne sont pas terminés : pas d'ajout\033[0m")
             note("attente fin DL")
-            return False
-        return True
+            return 0
+        return 1
 
-    if any(t.get('status') in DOWNLOADING_STATUS for t in torrents):
+    active = sum(1 for t in torrents if t.get('status') in DOWNLOADING_STATUS) + len(waiting_pending(torrents))
+
+    if ADD_POLICY == 'max_downloads':
+        slots = max(0, MAX_DOWNLOADS - active)
+        print(f"\033[1;33m>> Téléchargements en cours : {active}/{MAX_DOWNLOADS}, places libres : {slots}\033[0m")
+        if not slots:
+            note(f"{active}/{MAX_DOWNLOADS} DL")
+        return slots
+
+    if active:
         print("\033[1;33m>> Téléchargement en cours : pas d'ajout\033[0m")
         note("attente fin DL")
-        return False
-    return True
+        return 0
+    return 1
+
+
+def space_budget(torrents):
+    """Octets qu'on peut encore engager sans passer sous MIN_FREE_GB une fois
+    tous les téléchargements terminés : libre - reste à télécharger - minimum."""
+    try:
+        free = shutil.disk_usage(SPACE_CHECK_PATH).free
+    except OSError as e:
+        print(f"Erreur espace disque sur {SPACE_CHECK_PATH}: {e}", file=sys.stderr)
+        return 0
+
+    left = sum(t.get('leftUntilDone') or 0 for t in torrents if not is_done(t))
+    left += sum(p.get('size') or 0 for p in waiting_pending(torrents))
+    budget = free - left - MIN_FREE_GB * BYTES_PER_GB
+
+    print(f">> Libre {free / BYTES_PER_GB:.1f} GB - reste à télécharger {left / BYTES_PER_GB:.1f} GB"
+          f" - minimum {MIN_FREE_GB} GB = disponible pour ajout {budget / BYTES_PER_GB:.1f} GB")
+    return budget
 
 
 def c411_url(params):
@@ -943,7 +981,7 @@ def fetch_c411():
     return candidates
 
 
-def pick_candidate(candidates, torrents):
+def pick_candidates(candidates, torrents):
     known_names = {t.get('name') for t in torrents if t.get('name')}
     pending_ids = {p.get('c411_id') for p in read_json(OUTPUT_PENDING, [])}
 
@@ -955,11 +993,7 @@ def pick_candidate(candidates, torrents):
         if c['name'] in known_names or cid in pending_ids or (WATCH_DIR / f'c411_{cid}.torrent').exists():
             continue
         if c['size'] < MAX_TORRENT_GB * BYTES_PER_GB and c['seeders'] < MAX_SEEDERS:
-            print(f"Trouvé: {c['name'][:60]} ({c['size'] / BYTES_PER_GB:.1f}G, {c['seeders']} seeders)")
-            return c
-
-    print(f"Aucun nouveau torrent avec taille < {MAX_TORRENT_GB}Go et seeders < {MAX_SEEDERS}")
-    return None
+            yield c
 
 
 def download_torrent(c411_id):
@@ -985,27 +1019,50 @@ def download_torrent(c411_id):
         return None
 
 
-def add_torrent(torrents):
+def add_torrents(torrents, slots):
+    """Ajoute jusqu'à `slots` torrents, chacun seulement s'il tient dans space_budget()."""
+    budget = space_budget(torrents)
+    if budget <= 0:
+        print("\033[1;33m>> Pas assez de place pour un ajout (MIN_FREE_GB)\033[0m")
+        note("pas de place pour ajout")
+        return 0
+
     candidates = fetch_c411()
     if candidates is None:
         note("C411 injoignable")
         return 1
 
-    best = pick_candidate(candidates, torrents)
-    if best is None:
+    added = 0
+    too_big = 0
+    for c in pick_candidates(candidates, torrents):
+        if added >= slots:
+            break
+        if c['size'] > budget:
+            too_big += 1
+            continue
+
+        print(f"Trouvé: {c['name'][:60]} ({c['size'] / BYTES_PER_GB:.1f}G, {c['seeders']} seeders)")
+        torrent_file = download_torrent(c['id'])
+        if torrent_file is None:
+            note("echec telechargement .torrent")
+            return 1
+
+        note(f"+{c.get('name', '')[:28]}")
+        added += 1
+        budget -= c['size']
+
+        if START_TIMEOUT_MIN:
+            register_pending(c['id'], c.get('name', ''), c['size'], torrent_file)
+            print(f">> Torrent surveillé : supprimé s'il ne démarre pas en {START_TIMEOUT_MIN} min")
+
+    if not added:
+        if too_big:
+            print(f"Aucun candidat assez petit pour garder {MIN_FREE_GB} Go libres ({too_big} trop gros)")
+            note("candidats trop gros pour MIN_FREE_GB")
+            return 0
+        print(f"Aucun nouveau torrent avec taille < {MAX_TORRENT_GB}Go et seeders < {MAX_SEEDERS}")
         note("aucun candidat C411")
         return 1
-
-    torrent_file = download_torrent(best['id'])
-    if torrent_file is None:
-        note("echec telechargement .torrent")
-        return 1
-
-    note(f"+{best.get('name', '')[:28]}")
-
-    if START_TIMEOUT_MIN:
-        register_pending(best['id'], best.get('name', ''), torrent_file)
-        print(f">> Torrent surveillé : supprimé s'il ne démarre pas en {START_TIMEOUT_MIN} min")
     return 0
 
 
@@ -1101,11 +1158,12 @@ def main():
 
     print("\033[1;33m>> Ok il reste de la place\033[0m")
 
-    if not can_add(torrents):
+    slots = free_slots(torrents)
+    if not slots:
         sys.exit(0)
 
-    print("\033[1;33m>> Conditions OK : ajout d'un nouveau torrent\033[0m")
-    sys.exit(add_torrent(torrents))
+    print(f"\033[1;33m>> Conditions OK : jusqu'à {slots} ajout(s)\033[0m")
+    sys.exit(add_torrents(torrents, slots))
 
 
 if __name__ == "__main__":
