@@ -3,7 +3,8 @@
 
 # Automatisation Transmission + C411.
 #
-# Même code sur toutes les machines : seul le bloc CONFIGURATION change.
+# Un seul script pour toutes les machines : les réglages de chacune sont dans un
+# fichier JSON (c411.json à côté du script, ou --config FICHIER).
 #
 # - relève l'état de Transmission (session, stats, torrents) dans BASE_DIR
 # - surveille le démarrage des torrents ajoutés (START_TIMEOUT_MIN)
@@ -13,6 +14,7 @@
 # - écrit un résumé d'une ligne (130 caractères max) dans STATUS_FILE
 #
 # Options :
+#   --config FICHIER   configuration JSON de la machine (défaut : c411.json à côté du script)
 #   --dry-run          simule les suppressions
 #   --force-delete     suppressions réelles, même si DRY_RUN_DEFAULT = True
 #   --skip-orphans     n'analyse pas / ne nettoie pas les orphelins disque
@@ -36,58 +38,125 @@ from datetime import datetime
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIGURATION : seule partie qui change d'une machine à l'autre
+# CONFIGURATION : lue dans un fichier JSON propre à chaque machine
 # ═══════════════════════════════════════════════════════════════════════════════
 
-MACHINE = 'machine2'
+# Par défaut c411.json à côté du script ; un autre fichier avec --config CHEMIN.
+DEFAULT_CONFIG = Path(__file__).resolve().with_name('c411.json')
 
-# Transmission RPC
-HOST = 'localhost'
-PORT = 9192
-USERNAME = 'transmission'
-PASSWORD = 'changeme'
+REQUIRED = object()
 
-# C411
-C411_APIKEY = 'YOUR_C411_API_KEY'
-C411_CAT = '6000'               # catégorie Torznab recherchée
-MAX_TORRENT_GB = 20             # taille max d'un torrent candidat
-MAX_SEEDERS = 5                 # candidat retenu s'il a moins de N seeders
+# clé JSON : (valeur par défaut, type attendu) ; la clé devient la constante en majuscules
+CONFIG_KEYS = {
+    'machine':               (REQUIRED, str),           # nom affiché dans les rapports et le résumé
+    'host':                  ('localhost', str),        # Transmission RPC
+    'port':                  (REQUIRED, int),
+    'username':              ('transmission', str),
+    'password':              (REQUIRED, str),
+    'c411_apikey':           (REQUIRED, str),           # C411
+    'c411_cat':              (REQUIRED, 'cat'),         # catégorie Torznab recherchée
+    'max_torrent_gb':        (REQUIRED, 'number'),      # taille max d'un torrent candidat
+    'max_seeders':           (REQUIRED, int),           # candidat retenu s'il a moins de N seeders
+    'base_dir':              ('/root/scripts', 'path'), # fichiers JSON d'état
+    'watch_dir':             (REQUIRED, 'path'),        # dossier surveillé par Transmission
+    'download_dir':          (None, 'path'),            # null = dossiers lus dans les torrents
+    'min_free_gb':           (30, 'number'),            # sous ce seuil libre, un torrent est supprimé
+    'space_check_path':      (REQUIRED, 'path'),        # où l'espace libre est mesuré
+    'dry_run_default':       (False, bool),             # true = suppressions simulées sauf --force-delete
+    'victim_policy':         ('ratio', ('ratio', 'oldest')),
+    'add_policy':            ('max_downloads', ('max_downloads', 'all_finished', 'no_download')),
+    'max_downloads':         (3, int),                  # téléchargements simultanés (add_policy max_downloads)
+    'start_timeout_min':     (15, int),                 # null = surveillance du démarrage désactivée
+    'stall_minutes_default': (10, int),                 # valeur de --rm-stalled sans argument
+}
+NULLABLE = {'download_dir', 'start_timeout_min'}
 
-# Dossiers
-BASE_DIR = Path('/root/scripts')            # fichiers JSON d'état
-WATCH_DIR = Path('/srv/watch')              # dossier surveillé par Transmission
-DOWNLOAD_DIR = None                         # None = dossiers lus dans les torrents
 
-# Espace
-MIN_FREE_GB = 30                # sous ce seuil libre sur SPACE_CHECK_PATH, un torrent est supprimé
-SPACE_CHECK_PATH = Path('/')
+def config_error(path, message):
+    print(f"Erreur configuration {path}: {message}", file=sys.stderr)
+    sys.exit(2)
 
-# Comportement
-DRY_RUN_DEFAULT = False         # True = suppressions simulées sauf avec --force-delete
-VICTIM_POLICY = 'ratio'         # 'ratio' : terminé au plus faible ratio | 'oldest' : inactif depuis le plus longtemps
-ADD_POLICY = 'max_downloads'    # 'max_downloads' : moins de MAX_DOWNLOADS en cours | 'all_finished' : tous terminés | 'no_download' : aucun DL en cours
-MAX_DOWNLOADS = 3               # téléchargements simultanés max (ADD_POLICY = 'max_downloads')
-START_TIMEOUT_MIN = 15          # supprime un ajout qui n'a pas démarré après N min, None = désactivé
-STALL_MINUTES_DEFAULT = 10      # valeur de --rm-stalled sans argument
+
+def check_value(path, key, value, kind):
+    if value is None:
+        if key in NULLABLE:
+            return None
+        config_error(path, f"'{key}' ne peut pas être null")
+
+    if isinstance(kind, tuple):
+        if value not in kind:
+            config_error(path, f"'{key}' doit valoir {' ou '.join(kind)}, pas {value!r}")
+        return value
+    if kind == 'path':
+        if not isinstance(value, str) or not value:
+            config_error(path, f"'{key}' doit être un chemin (texte)")
+        return Path(value)
+    if kind == 'cat':
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            config_error(path, f"'{key}' doit être un nombre ou un texte")
+        return str(value)
+    if kind == 'number':
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            config_error(path, f"'{key}' doit être un nombre")
+        return value
+    # bool est un int en Python : on refuse true/false là où un nombre est attendu
+    if isinstance(value, bool) != (kind is bool) or not isinstance(value, kind):
+        config_error(path, f"'{key}' doit être de type {kind.__name__}")
+    return value
+
+
+def load_config(path):
+    """Lit le JSON de la machine et crée les constantes (MACHINE, PORT, ...)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        config_error(path, "fichier introuvable (copier l'exemple en c411.json ou passer --config)")
+    except (OSError, ValueError) as e:
+        config_error(path, e)
+    if not isinstance(data, dict):
+        config_error(path, "le fichier doit contenir un objet JSON { ... }")
+
+    unknown = sorted(set(data) - set(CONFIG_KEYS))
+    if unknown:
+        config_error(path, f"clé(s) inconnue(s) : {', '.join(unknown)}")
+
+    cfg = {}
+    for key, (default, kind) in CONFIG_KEYS.items():
+        if key not in data:
+            if default is REQUIRED:
+                config_error(path, f"clé obligatoire absente : '{key}'")
+            value = default
+        else:
+            value = data[key]
+        cfg[key.upper()] = check_value(path, key, value, kind)
+
+    g = globals()
+    g.update(cfg)
+    g['CONFIG_PATH'] = Path(path)
+    g['URL_RPC'] = f"http://{HOST}:{PORT}/transmission/rpc"
+    for name, filename in OUTPUT_FILES.items():
+        g[name] = BASE_DIR / filename
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CODE COMMUN : identique sur toutes les machines, ne rien modifier en dessous
+# CODE COMMUN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-URL_RPC = f'http://{HOST}:{PORT}/transmission/rpc'
 URL_C411 = 'https://c411.org/api'
 USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0'
 TORZNAB_ATTR = '{http://torznab.com/schemas/2015/feed}attr'
 
-OUTPUT_TRANS = BASE_DIR / 'get_transmission.json'
-OUTPUT_TRANS_FULL = BASE_DIR / 'get_transmission_full.json'
-OUTPUT_TRANS_SUMMARY = BASE_DIR / 'get_transmission_summary.json'
-OUTPUT_SESSION = BASE_DIR / 'get_transmission_session.json'
-OUTPUT_STATS = BASE_DIR / 'get_transmission_stats.json'
-OUTPUT_C411 = BASE_DIR / 'get_c411.json'
-OUTPUT_ORPHANS = BASE_DIR / 'get_orphans.json'
-OUTPUT_STALL_STATE = BASE_DIR / 'get_stalled_state.json'
-OUTPUT_PENDING = BASE_DIR / 'get_pending_torrents.json'
+# fichiers d'état écrits dans BASE_DIR (chemins créés par load_config)
+OUTPUT_FILES = {
+    'OUTPUT_TRANS': 'get_transmission.json',
+    'OUTPUT_TRANS_FULL': 'get_transmission_full.json',
+    'OUTPUT_TRANS_SUMMARY': 'get_transmission_summary.json',
+    'OUTPUT_SESSION': 'get_transmission_session.json',
+    'OUTPUT_STATS': 'get_transmission_stats.json',
+    'OUTPUT_C411': 'get_c411.json',
+    'OUTPUT_ORPHANS': 'get_orphans.json',
+    'OUTPUT_STALL_STATE': 'get_stalled_state.json',
+    'OUTPUT_PENDING': 'get_pending_torrents.json',
+}
 
 STATUS_FILE = Path('/var/log/torrents_status')
 STATUS_MAX_LEN = 130
@@ -433,6 +502,7 @@ def print_torrents_summary(summary):
 def print_session_report(session, stats, free_space_info, dry_run, args):
     print("\nInformations session Transmission:\n")
     print(f"Machine                : {MACHINE} (port {PORT})")
+    print(f"Configuration          : {CONFIG_PATH}")
     print(f"Mode suppression       : {'DRY-RUN' if dry_run else 'DELETE'}")
     print(f"Mode rmall             : {args.rmall}")
     print(f"DL bloqués (rm-stalled): {f'{args.rm_stalled} min' if args.rm_stalled is not None else 'désactivé'}")
@@ -1072,7 +1142,25 @@ def add_torrents(torrents, slots):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=f"Transmission + C411 manager ({MACHINE})")
+    # --config d'abord : les valeurs par défaut des autres options viennent du JSON
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        metavar="FICHIER",
+        help=f"configuration JSON de la machine (défaut {DEFAULT_CONFIG})"
+    )
+    known, _ = pre.parse_known_args()
+
+    asking_help = bool({'-h', '--help'} & set(sys.argv[1:]))
+    if asking_help and not known.config.exists():
+        # l'aide s'affiche même sans fichier de configuration
+        globals().update(MACHINE='?', STALL_MINUTES_DEFAULT=CONFIG_KEYS['stall_minutes_default'][0])
+    else:
+        load_config(known.config)
+
+    parser = argparse.ArgumentParser(description=f"Transmission + C411 manager ({MACHINE})", parents=[pre])
     parser.add_argument(
         "--dry-run",
         action="store_true",
