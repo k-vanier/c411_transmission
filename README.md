@@ -17,9 +17,18 @@ settings only in the configuration block.
 4. Orphans: files and folders in the download directory that belong to no torrent are deleted.
 5. Free space: if less than `MIN_FREE_GB` is free on `SPACE_CHECK_PATH`, one torrent is removed
    according to `VICTIM_POLICY`, then free space is checked again.
-6. Add: if there is enough space and `ADD_POLICY` allows it, the script searches the indexer and drops
-   the first new candidate (smaller than `MAX_TORRENT_GB`, fewer than `MAX_SEEDERS` seeders, not already
-   in Transmission or in the watch folder) into `WATCH_DIR`.
+6. Add: `ADD_POLICY` gives the number of torrents that can be added now (with `max_downloads`:
+   `MAX_DOWNLOADS` minus the torrents downloading or queued, minus the `.torrent` files dropped but not yet
+   picked up by Transmission). The script then searches the indexer and drops new candidates (smaller than
+   `MAX_TORRENT_GB`, fewer than `MAX_SEEDERS` seeders, not already in Transmission or in the watch folder)
+   into `WATCH_DIR`, as long as each one fits in the space budget:
+
+   ```
+   budget = free space - bytes still to download - MIN_FREE_GB
+   ```
+
+   so `MIN_FREE_GB` stays free once every download has finished. A candidate larger than the budget is
+   skipped for a smaller one; each added torrent is taken off the budget.
 7. Writes a one-line summary (130 ASCII characters max) to `/var/log/torrents_status`, overwritten on each run:
 
    ```
@@ -43,7 +52,8 @@ settings only in the configuration block.
 | `MIN_FREE_GB`, `SPACE_CHECK_PATH` | minimum free space and the path where it is measured |
 | `DRY_RUN_DEFAULT` | `True` = deletions are simulated unless `--force-delete` is given |
 | `VICTIM_POLICY` | `ratio`: finished torrent with the lowest ratio, idle ones first; `oldest`: inactive for the longest time |
-| `ADD_POLICY` | `all_finished`: add only when every torrent is complete; `no_download`: add when nothing is downloading |
+| `ADD_POLICY` | `max_downloads`: keep up to `MAX_DOWNLOADS` downloads running; `all_finished`: add one only when every torrent is complete; `no_download`: add one when nothing is downloading |
+| `MAX_DOWNLOADS` | simultaneous downloads with `ADD_POLICY = 'max_downloads'` |
 | `START_TIMEOUT_MIN` | start watch delay in minutes; `None` disables it |
 | `STALL_MINUTES_DEFAULT` | value of `--rm-stalled` without an argument |
 
