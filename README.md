@@ -16,10 +16,14 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
    minutes is removed with its data, and its `.torrent` is deleted from `watch_dir`.
 3. With `--rm-stalled [MIN]`: a downloading torrent whose received bytes have not changed for MIN minutes
    is removed with its data. Progress is tracked between runs in `get_stalled_state.json`.
-4. Orphans: files and folders in the download directory that belong to no torrent are deleted.
-5. Free space: if less than `min_free_gb` is free on `space_check_path`, one torrent is removed
+4. Idle torrents: with `idle_remove_hours` set, every finished torrent (seeding or stopped) with no data
+   exchanged for that many hours is removed with its data, even when there is enough free space.
+   A torrent uploading right now is kept. Last activity is Transmission's `activityDate`, or the
+   completion date, or the date added.
+5. Orphans: files and folders in the download directory that belong to no torrent are deleted.
+6. Free space: if less than `min_free_gb` is free on `space_check_path`, one torrent is removed
    according to `victim_policy`, then free space is checked again.
-6. Add: `add_policy` gives the number of torrents that can be added now (with `max_downloads`:
+7. Add: `add_policy` gives the number of torrents that can be added now (with `max_downloads`:
    `max_downloads` minus the torrents downloading or queued, minus the `.torrent` files dropped but not yet
    picked up by Transmission). The script then searches the indexer and drops new candidates (smaller than
    `max_torrent_gb`, fewer than `max_seeders` seeders, not already in Transmission or in the watch folder)
@@ -31,7 +35,7 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
 
    so `min_free_gb` stays free once every download has finished. A candidate larger than the budget is
    skipped for a smaller one; each added torrent is taken off the budget.
-7. Writes a one-line summary (130 ASCII characters max) to `/var/log/torrents_status`, overwritten on each run:
+8. Writes a one-line summary (130 ASCII characters max) to `/var/log/torrents_status`, overwritten on each run:
 
    ```
    machine1 25/10 13:10 15t 1dl 14seed 0stop r1.40 libre 1200G | -2 orphelin, +Some.Movie.2024.1080p
@@ -64,6 +68,7 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
 | `max_downloads` | `3` | simultaneous downloads with `add_policy` `max_downloads` |
 | `start_timeout_min` | `15` | start watch delay in minutes; `null` disables it |
 | `stall_minutes_default` | `10` | value of `--rm-stalled` without an argument |
+| `idle_remove_hours` | `null` | remove finished torrents with no activity for that many hours (decimals allowed); `null` = never |
 
 The file is checked before anything else: a missing required key, a wrong type, an unknown value or an
 unknown key (typo) stops the script with a message and exit code 2.

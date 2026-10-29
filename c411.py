@@ -8,6 +8,7 @@
 #
 # - relève l'état de Transmission (session, stats, torrents) dans BASE_DIR
 # - surveille le démarrage des torrents ajoutés (START_TIMEOUT_MIN)
+# - supprime les torrents terminés sans activité depuis IDLE_REMOVE_HOURS heures
 # - nettoie les fichiers orphelins du dossier de téléchargement
 # - s'il reste moins de MIN_FREE_GB sur le disque, supprime un torrent selon VICTIM_POLICY
 # - sinon, si ADD_POLICY le permet, dépose un nouveau torrent C411 dans WATCH_DIR
@@ -68,8 +69,9 @@ CONFIG_KEYS = {
     'max_downloads':         (3, int),                  # téléchargements simultanés (add_policy max_downloads)
     'start_timeout_min':     (15, int),                 # null = surveillance du démarrage désactivée
     'stall_minutes_default': (10, int),                 # valeur de --rm-stalled sans argument
+    'idle_remove_hours':     (None, 'number'),          # supprime les terminés inactifs depuis N h, null = jamais
 }
-NULLABLE = {'download_dir', 'start_timeout_min'}
+NULLABLE = {'download_dir', 'start_timeout_min', 'idle_remove_hours'}
 
 
 def config_error(path, message):
@@ -507,6 +509,7 @@ def print_session_report(session, stats, free_space_info, dry_run, args):
     print(f"Mode rmall             : {args.rmall}")
     print(f"DL bloqués (rm-stalled): {f'{args.rm_stalled} min' if args.rm_stalled is not None else 'désactivé'}")
     print(f"Surveillance démarrage : {f'{START_TIMEOUT_MIN} min' if START_TIMEOUT_MIN else 'désactivée'}")
+    print(f"Inactifs supprimés     : {f'après {IDLE_REMOVE_HOURS} h' if IDLE_REMOVE_HOURS else 'jamais'}")
     print(f"Version                : {session.get('version', 'N/A')}")
     print(f"RPC version            : {session.get('rpc-version', 'N/A')} / {session.get('rpc-version-semver', 'N/A')}")
     print(f"Répertoire download    : {session.get('download-dir', 'N/A')}")
@@ -642,6 +645,53 @@ def check_pending(trans, torrents, dry_run):
     if removed:
         note(f"-{removed} non demarre")
     return deleted_any
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TORRENTS TERMINÉS INACTIFS (IDLE_REMOVE_HOURS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def rm_idle(trans, torrents, hours, dry_run):
+    """Supprime les torrents terminés sans activité (ni envoi ni réception) depuis
+    `hours` heures, même s'il reste de la place. Un torrent qui envoie en ce
+    moment est gardé. Retourne True si au moins une suppression réelle a eu lieu."""
+    now = int(time.time())
+    limit = hours * 3600
+    idle = []
+
+    for t in torrents:
+        if t.get('status') not in INACTIVE_STATUS or not is_done(t):
+            continue
+        if t.get('rateUpload') or t.get('peersGettingFromUs'):
+            continue
+        # activityDate = dernier échange de données ; à défaut fin du DL, puis ajout
+        last = t.get('activityDate') or t.get('doneDate') or t.get('addedDate') or now
+        if now - last >= limit:
+            idle.append((t, (now - last) // 3600))
+
+    print(f"\n>> Torrents terminés inactifs depuis plus de {hours} h : {len(idle)}")
+
+    removed = 0
+    for t, idle_h in idle:
+        tid = t.get('id')
+        label = (f"ID {tid} {(t.get('name') or 'N/A')[:60]} "
+                 f"(ratio {human_ratio(t.get('uploadRatio'))}, inactif depuis {idle_h} h)")
+
+        if dry_run:
+            print(f"[DRY-RUN] Suppression de {label}")
+            continue
+
+        try:
+            trans.remove([tid])
+            print(f"[DELETE] {label}")
+            removed += 1
+        except Exception as e:
+            print(f"[ERREUR] suppression ID {tid}: {e}", file=sys.stderr)
+
+    count = len(idle) if dry_run else removed
+    if count:
+        note(f"-{count} inactif")
+    return removed > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1225,6 +1275,9 @@ def main():
         torrents = get_torrents(trans)
 
     if args.rm_stalled is not None and rm_stalled(trans, torrents, args.rm_stalled, dry_run):
+        torrents = get_torrents(trans)
+
+    if IDLE_REMOVE_HOURS and rm_idle(trans, torrents, IDLE_REMOVE_HOURS, dry_run):
         torrents = get_torrents(trans)
 
     if not args.skip_orphans:

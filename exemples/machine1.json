@@ -22,5 +22,6 @@
   "add_policy": "max_downloads",
   "max_downloads": 3,
   "start_timeout_min": 15,
-  "stall_minutes_default": 10
+  "stall_minutes_default": 10,
+  "idle_remove_hours": 48
 }
