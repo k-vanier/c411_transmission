@@ -21,20 +21,31 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
    A torrent uploading right now is kept. Last activity is Transmission's `activityDate`, or the
    completion date, or the date added.
 5. Orphans: files and folders in the download directory that belong to no torrent are deleted.
-6. Free space: if less than `min_free_gb` is free on `space_check_path`, one torrent is removed
-   according to `victim_policy`, then free space is checked again.
-7. Add: `add_policy` gives the number of torrents that can be added now (with `max_downloads`:
-   `max_downloads` minus the torrents downloading or queued, minus the `.torrent` files dropped but not yet
-   picked up by Transmission). The script then searches the indexer and drops new candidates (smaller than
-   `max_torrent_gb`, fewer than `max_seeders` seeders, not already in Transmission or in the watch folder)
-   into `watch_dir`, as long as each one fits in the space budget:
+6. Free space, measured ahead: the space budget is
 
    ```
-   budget = free space - bytes still to download - min_free_gb
+   budget = free space on space_check_path - bytes still to download - min_free_gb
    ```
 
-   so `min_free_gb` stays free once every download has finished. A candidate larger than the budget is
-   skipped for a smaller one; each added torrent is taken off the budget.
+   so `min_free_gb` stays free once every download has finished. If the budget is negative (the running
+   downloads would end below `min_free_gb`), finished torrents are removed in `victim_policy` order until
+   it is back to zero.
+7. Add, with rotation: `add_policy` gives the number of torrents that can be added now (with
+   `max_downloads`: `max_downloads` minus the torrents downloading or queued, minus the `.torrent` files
+   dropped but not yet picked up by Transmission). The script searches the indexer for new candidates
+   (smaller than `max_torrent_gb`, fewer than `max_seeders` seeders, not already in Transmission, in the
+   watch folder or removed before) and drops them into `watch_dir`:
+   - candidates that fit in the budget go first;
+   - for one that does not fit, finished torrents are removed in `victim_policy` order until it fits, so
+     downloads keep rotating even when the disk is at `min_free_gb`;
+   - nothing is removed for a candidate that would not fit even after removing every finished torrent;
+   - each added torrent is taken off the budget.
+
+   Removal order with `victim_policy` `ratio`: finished torrents (seeding or stopped) that nobody is
+   downloading from, lowest ratio first, then the others, lowest ratio first. Downloads in progress are
+   never removed. Every removed torrent is remembered in `get_removed_torrents.json` (last 1000 names)
+   and never taken again from the indexer, so the rotation cannot download and remove the same torrent
+   in a loop. In `--dry-run`, a candidate that needs a simulated removal is not added.
 8. Writes a one-line summary (130 ASCII characters max) to `/var/log/torrents_status`, overwritten on each run:
 
    ```
@@ -60,7 +71,7 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
 | `base_dir` | `/root/scripts` | where the JSON state files are written |
 | `watch_dir` | required | folder watched by Transmission (`watch-dir` in its settings) |
 | `download_dir` | `null` | download folder scanned for orphans; `null` = folders read from the torrents |
-| `min_free_gb` | `30` | minimum free space; below it a torrent is removed and nothing is added |
+| `min_free_gb` | `30` | free space kept once every download has finished; finished torrents are removed to stay above it and to make room for new ones |
 | `space_check_path` | required | path where free space is measured |
 | `dry_run_default` | `false` | `true` = deletions are simulated unless `--force-delete` is given |
 | `victim_policy` | `ratio` | `ratio`: finished torrent with the lowest ratio, idle ones first; `oldest`: inactive for the longest time |
