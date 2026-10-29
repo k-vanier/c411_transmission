@@ -10,8 +10,10 @@
 # - surveille le démarrage des torrents ajoutés (START_TIMEOUT_MIN)
 # - supprime les torrents terminés sans activité depuis IDLE_REMOVE_HOURS heures
 # - nettoie les fichiers orphelins du dossier de téléchargement
-# - s'il reste moins de MIN_FREE_GB sur le disque, supprime un torrent selon VICTIM_POLICY
-# - sinon, si ADD_POLICY le permet, dépose un nouveau torrent C411 dans WATCH_DIR
+# - garde MIN_FREE_GB libres une fois tous les téléchargements finis : sinon supprime
+#   des torrents terminés selon VICTIM_POLICY
+# - rotation : si ADD_POLICY le permet, dépose de nouveaux torrents C411 dans WATCH_DIR,
+#   en supprimant des torrents terminés (VICTIM_POLICY) quand il faut faire de la place
 # - écrit un résumé d'une ligne (130 caractères max) dans STATUS_FILE
 #
 # Options :
@@ -158,6 +160,7 @@ OUTPUT_FILES = {
     'OUTPUT_ORPHANS': 'get_orphans.json',
     'OUTPUT_STALL_STATE': 'get_stalled_state.json',
     'OUTPUT_PENDING': 'get_pending_torrents.json',
+    'OUTPUT_REMOVED': 'get_removed_torrents.json',
 }
 
 STATUS_FILE = Path('/var/log/torrents_status')
@@ -256,6 +259,18 @@ def read_json(path, default):
 
 def is_done(t):
     return (t.get('percentDone') or 0) >= 1
+
+
+REMOVED_KEEP = 1000     # noms gardés dans OUTPUT_REMOVED
+
+
+def remember_removed(names):
+    # un torrent supprimé ne doit pas être repris sur C411 : sinon la rotation
+    # le retélécharge, le resupprime, etc.
+    removed = read_json(OUTPUT_REMOVED, [])
+    now = int(time.time())
+    removed += [{'name': n, 'removed_at': now} for n in names if n]
+    write_json(OUTPUT_REMOVED, removed[-REMOVED_KEEP:])
 
 
 def ensure_dirs():
@@ -374,8 +389,10 @@ class Transmission:
             raise RuntimeError(f"Erreur RPC {method}: {data.get('result')}")
         return data.get("arguments", {})
 
-    def remove(self, ids):
-        self.call("torrent-remove", {"ids": ids, "delete-local-data": True})
+    def remove(self, torrents, remember=True):
+        self.call("torrent-remove", {"ids": [t.get('id') for t in torrents], "delete-local-data": True})
+        if remember:
+            remember_removed(t.get('name') for t in torrents)
 
 
 def get_session_info(trans):
@@ -617,7 +634,7 @@ def check_pending(trans, torrents, dry_run):
                 remaining.append(p)
                 continue
             try:
-                trans.remove([match.get('id')])
+                trans.remove([match])
                 print("     [DELETE] torrent supprimé avec ses données")
                 deleted_any = True
                 removed += 1
@@ -632,6 +649,9 @@ def check_pending(trans, torrents, dry_run):
                 remaining.append(p)
                 continue
             deleted_any = True
+
+        # le nom C411 peut différer de celui de Transmission : on retient les deux
+        remember_removed([name])
 
         torrent_file = p.get('torrent_file')
         if torrent_file and Path(torrent_file).exists():
@@ -682,7 +702,7 @@ def rm_idle(trans, torrents, hours, dry_run):
             continue
 
         try:
-            trans.remove([tid])
+            trans.remove([t])
             print(f"[DELETE] {label}")
             removed += 1
         except Exception as e:
@@ -745,7 +765,7 @@ def rm_stalled(trans, torrents, minutes, dry_run):
             continue
 
         try:
-            trans.remove([tid])
+            trans.remove([t])
             print(f"[DELETE] {label}")
             new_state.pop(h, None)
             removed += 1
@@ -900,14 +920,20 @@ def ratio_key(t):
     return (r, t.get('activityDate') or 0)
 
 
-def pick_by_ratio(torrents):
-    # candidats : torrents terminés, en seed ou arrêtés
-    finished = [t for t in torrents if t.get('status') in INACTIVE_STATUS and is_done(t)]
-    # priorité aux inactifs : personne ne télécharge depuis nous
-    idle = [t for t in finished if not t.get('rateUpload') and not t.get('peersGettingFromUs')]
-    print(f">> {len(finished)} torrents terminés ({len(idle)} inactifs)")
-    pool = idle or finished
-    return min(pool, key=ratio_key) if pool else None
+def victim_order(torrents):
+    """Torrents supprimables pour faire de la place, dans l'ordre de VICTIM_POLICY."""
+    if VICTIM_POLICY == 'ratio':
+        # torrents terminés, en seed ou arrêtés ; d'abord ceux que personne ne télécharge
+        finished = [t for t in torrents if t.get('status') in INACTIVE_STATUS and is_done(t)]
+        idle = [t for t in finished if not t.get('rateUpload') and not t.get('peersGettingFromUs')]
+        busy = [t for t in finished if t not in idle]
+        return sorted(idle, key=ratio_key) + sorted(busy, key=ratio_key)
+    return sorted((t for t in torrents if t.get('status') in INACTIVE_STATUS), key=oldest_key)
+
+
+def torrent_bytes(t):
+    # place rendue au budget : données présentes + reste à télécharger (déjà retenu par space_budget)
+    return t.get('sizeWhenDone') or t.get('totalSize') or 0
 
 
 def oldest_key(t):
@@ -920,21 +946,9 @@ def oldest_key(t):
     )
 
 
-def pick_oldest(torrents):
-    inactive = [t for t in torrents if t.get('status') in INACTIVE_STATUS]
-    print(f">> {len(inactive)} torrents inactifs (stoppé/seed)")
-    return min(inactive, key=oldest_key) if inactive else None
-
-
-def remove_victim(trans, torrents, dry_run):
-    """Supprime un torrent selon VICTIM_POLICY.
-    Retourne None si rien n'a pu être supprimé, False en dry-run, True si supprimé."""
-    victim = pick_by_ratio(torrents) if VICTIM_POLICY == 'ratio' else pick_oldest(torrents)
-    if victim is None:
-        print("Aucun torrent candidat à la suppression.")
-        note("disque plein, rien a supprimer")
-        return None
-
+def remove_victim(trans, victim, dry_run):
+    """Supprime un torrent choisi par victim_order().
+    Retourne None si la suppression a échoué, False en dry-run, True si supprimé."""
     tid = victim.get('id')
     ratio = ratio_key(victim)[0]
 
@@ -961,13 +975,41 @@ def remove_victim(trans, torrents, dry_run):
         return False
 
     try:
-        trans.remove([tid])
+        trans.remove([victim])
     except Exception as e:
         print(f"ERREUR suppression: {e}", file=sys.stderr)
         STATUS['actions'][-1] = "echec suppression"
         return None
 
     print(f">> REUSSI : torrent {tid} + fichiers supprimés, {(victim.get('totalSize') or 0) / BYTES_PER_GB:.1f} GB libérés")
+    return True
+
+
+def make_room(trans, room, needed, dry_run):
+    """Supprime des torrents, dans l'ordre de VICTIM_POLICY, jusqu'à ce que
+    room['budget'] >= needed. Ne supprime rien si même tous les supprimables ne
+    suffiraient pas. Retourne True si la place est faite (ou simulée en dry-run)."""
+    if room['budget'] >= needed:
+        return True
+
+    plan, budget = [], room['budget']
+    for t in room['victims']:
+        if budget >= needed:
+            break
+        plan.append(t)
+        budget += torrent_bytes(t)
+    if budget < needed:
+        return False
+
+    print(f">> Rotation : {len(plan)} torrent(s) à supprimer pour libérer {(needed - room['budget']) / BYTES_PER_GB:.1f} GB")
+    for t in plan:
+        if remove_victim(trans, t, dry_run) is None:
+            return False
+        room['victims'].remove(t)
+        room['budget'] += torrent_bytes(t)
+        room['removed'] += 1
+        if dry_run:
+            room['simulated'] = True
     return True
 
 
@@ -999,7 +1041,7 @@ def rm_all_torrents(trans, torrents, dry_run):
         return True
 
     try:
-        trans.remove(ids)
+        trans.remove([t for t in torrents if t.get('id') is not None], remember=False)
     except Exception as e:
         print(f"ERREUR --rmall: {e}", file=sys.stderr)
         return False
@@ -1105,13 +1147,15 @@ def fetch_c411():
 def pick_candidates(candidates, torrents):
     known_names = {t.get('name') for t in torrents if t.get('name')}
     pending_ids = {p.get('c411_id') for p in read_json(OUTPUT_PENDING, [])}
+    removed_names = {r.get('name') for r in read_json(OUTPUT_REMOVED, [])}
 
     for c in candidates:
         cid = c.get('id')
         if not cid:
             continue
-        # déjà dans Transmission, en attente de démarrage ou déjà déposé dans le dossier watch
-        if c['name'] in known_names or cid in pending_ids or (WATCH_DIR / f'c411_{cid}.torrent').exists():
+        # déjà dans Transmission, déjà supprimé, en attente de démarrage ou déjà dans le dossier watch
+        if (c['name'] in known_names or c['name'] in removed_names or cid in pending_ids
+                or (WATCH_DIR / f'c411_{cid}.torrent').exists()):
             continue
         if c['size'] < MAX_TORRENT_GB * BYTES_PER_GB and c['seeders'] < MAX_SEEDERS:
             yield c
@@ -1140,27 +1184,35 @@ def download_torrent(c411_id):
         return None
 
 
-def add_torrents(torrents, slots):
-    """Ajoute jusqu'à `slots` torrents, chacun seulement s'il tient dans space_budget()."""
-    budget = space_budget(torrents)
-    if budget <= 0:
-        print("\033[1;33m>> Pas assez de place pour un ajout (MIN_FREE_GB)\033[0m")
-        note("pas de place pour ajout")
-        return 0
-
+def add_torrents(trans, torrents, slots, room, dry_run):
+    """Ajoute jusqu'à `slots` torrents. Ceux qui tiennent dans room['budget'] passent
+    d'abord ; pour les autres, make_room() supprime des torrents terminés (rotation)."""
     candidates = fetch_c411()
     if candidates is None:
         note("C411 injoignable")
         return 1
 
+    eligible = list(pick_candidates(candidates, torrents))
+    if not eligible:
+        print(f"Aucun nouveau torrent avec taille < {MAX_TORRENT_GB}Go et seeders < {MAX_SEEDERS}")
+        note("aucun candidat C411")
+        return 1
+
+    # sans suppression d'abord, puis en faisant de la place
+    fitting = [c for c in eligible if c['size'] <= room['budget']]
+    ordered = fitting + [c for c in eligible if c not in fitting]
+
     added = 0
-    too_big = 0
-    for c in pick_candidates(candidates, torrents):
+    for c in ordered:
         if added >= slots:
             break
-        if c['size'] > budget:
-            too_big += 1
+        if c['size'] > room['budget'] and not make_room(trans, room, c['size'], dry_run):
             continue
+        if room['simulated']:
+            # place libérée seulement en simulation : ajouter dépasserait MIN_FREE_GB
+            print(f"[DRY-RUN] ajout de {c['name'][:60]} non fait : place libérée seulement en simulation")
+            note(f"+{c.get('name', '')[:28]} (apres rotation)")
+            break
 
         print(f"Trouvé: {c['name'][:60]} ({c['size'] / BYTES_PER_GB:.1f}G, {c['seeders']} seeders)")
         torrent_file = download_torrent(c['id'])
@@ -1170,20 +1222,15 @@ def add_torrents(torrents, slots):
 
         note(f"+{c.get('name', '')[:28]}")
         added += 1
-        budget -= c['size']
+        room['budget'] -= c['size']
 
         if START_TIMEOUT_MIN:
             register_pending(c['id'], c.get('name', ''), c['size'], torrent_file)
             print(f">> Torrent surveillé : supprimé s'il ne démarre pas en {START_TIMEOUT_MIN} min")
 
-    if not added:
-        if too_big:
-            print(f"Aucun candidat assez petit pour garder {MIN_FREE_GB} Go libres ({too_big} trop gros)")
-            note("candidats trop gros pour MIN_FREE_GB")
-            return 0
-        print(f"Aucun nouveau torrent avec taille < {MAX_TORRENT_GB}Go et seeders < {MAX_SEEDERS}")
-        note("aucun candidat C411")
-        return 1
+    if not added and not room['simulated']:
+        print(f"Aucun candidat ne tient, même en supprimant tous les torrents terminés (minimum {MIN_FREE_GB} Go)")
+        note("rien a supprimer pour faire place")
     return 0
 
 
@@ -1283,29 +1330,27 @@ def main():
     if not args.skip_orphans:
         delete_orphans(list_disk_orphans(torrents), dry_run=dry_run)
 
-    # la place passe avant tout : on supprime même si des téléchargements sont en cours
-    if not check_space(torrents):
-        print(">> Plus de place dispo, suppression d'un torrent...")
-        removed = remove_victim(trans, torrents, dry_run)
-        if removed is None:
-            sys.exit(1)
-        if not removed:
-            sys.exit(0)
+    # espace : MIN_FREE_GB doit rester libre une fois tous les téléchargements terminés ;
+    # sinon on supprime des torrents terminés (VICTIM_POLICY), même pendant les DL
+    check_space(torrents)
+    room = {'budget': space_budget(torrents), 'victims': victim_order(torrents),
+            'removed': 0, 'simulated': False}
 
-        torrents = get_torrents(trans)
-        if not check_space(torrents):
-            print("\033[1;33m>> Toujours pas assez de place : pas d'ajout\033[0m")
-            note("toujours plein")
+    if room['budget'] < 0:
+        print(f">> Les téléchargements en cours passeraient sous {MIN_FREE_GB} Go libres : suppression")
+        if not make_room(trans, room, 0, dry_run):
+            print("\033[1;33m>> Pas assez de torrents terminés à supprimer : pas d'ajout\033[0m")
+            note("disque plein, rien a supprimer")
             sys.exit(0)
-
-    print("\033[1;33m>> Ok il reste de la place\033[0m")
+    else:
+        print("\033[1;33m>> Ok il reste de la place\033[0m")
 
     slots = free_slots(torrents)
     if not slots:
         sys.exit(0)
 
     print(f"\033[1;33m>> Conditions OK : jusqu'à {slots} ajout(s)\033[0m")
-    sys.exit(add_torrents(torrents, slots))
+    sys.exit(add_torrents(trans, torrents, slots, room, dry_run))
 
 
 if __name__ == "__main__":
