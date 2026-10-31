@@ -49,23 +49,24 @@ One script, `c411.py`, for every machine. Each machine's settings live in a JSON
 8. Writes a one-line summary (130 ASCII characters max) to `/var/log/torrents_status`, overwritten on each run:
 
    ```
-   machine1 31/10 14:01 DL 3/3 (87% 45% 20%) +1 att | v1.5M ^2.0M | libre 98G dispo 41G | r1.57 285t | DL complet
+   DL 2/3 +1 att | libre 95G dispo 37G | env 44.0T rec 28.0T r1.57 | top 6.95 Some.Movie.2022 | flop 0.07 Other.Movie.20 | RAS
    ```
 
    | Part | Meaning |
    |---|---|
-   | `DL 3/3` | downloads running / `max_downloads` |
-   | `(87% 45% 20%)` | their progress, most advanced first (4 at most) |
+   | `DL 2/3` | downloads running / `max_downloads`, followed by their progress (`(89% 47%)`, most advanced first) when there is room |
    | `+1 att` | `.torrent` files dropped but not yet picked up by Transmission |
-   | `v1.5M ^2.0M` | download and upload speed |
-   | `libre 98G` | free space on `space_check_path` |
-   | `dispo 41G` / `manque 17G` | room for new torrents (free − still to download − `min_free_gb`), or what the rotation must free |
-   | `r1.57 285t` | global ratio (Transmission cumulative stats) and torrent count; `2err` added when torrents are in error |
+   | `libre 95G` | free space on `space_check_path` |
+   | `dispo 37G` / `manque 17G` | room for new torrents (free − still to download − `min_free_gb`), or what the rotation must free |
+   | `env 44.0T rec 28.0T` | total sent and received, all time (Transmission cumulative stats), in GB below 1 TB, then TB |
+   | `r1.57` | global ratio (sent / received); `2err` added when torrents are in error |
+   | `top 6.95 …` | finished torrent with the highest ratio |
+   | `flop 0.07 …` | finished torrent with the lowest ratio (roughly the first the rotation removes) |
    | last part | what the run did: `-2 rotation`, `-3 inactif`, `-1 orphelin`, `+Name`, `DL complet`… (`RAS` when nothing, `[sim]` in dry-run) |
 
-   When the line would exceed 130 characters, the progress percentages go first, then the speeds, so
-   the actions are cut last. If Transmission cannot be reached the line is
-   `machine1 31/10 14:01 libre 98G | ERREUR …`.
+   When the line would exceed 130 characters: the progress percentages go first, then the top/flop
+   names are shortened (16, 12, 8 characters), then only their ratios are kept, and the actions are
+   cut last. If Transmission cannot be reached the line is `libre 95G | ERREUR …`.
 
 ## Configuration (JSON)
 

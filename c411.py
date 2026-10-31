@@ -294,19 +294,20 @@ def to_ascii(text):
     return unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('ascii')
 
 
-def global_ratio():
-    # ratio cumulé de Transmission (toutes sessions), sinon celui des torrents présents
+def global_totals():
+    # octets envoyés et reçus depuis toujours (statistiques cumulées de Transmission),
+    # sinon ceux des torrents présents
     cum = (STATUS['stats'] or {}).get('cumulative-stats') or {}
     up, down = cum.get('uploadedBytes') or 0, cum.get('downloadedBytes') or 0
     if not down:
         torrents = STATUS['torrents'] or []
         up = sum(t.get('uploadedEver') or 0 for t in torrents)
         down = sum(t.get('downloadedEver') or 0 for t in torrents)
-    return f"r{up / down:.2f}" if down else "r-"
+    return up, down
 
 
 def short_size(num):
-    # 1.5M, 98G : tailles et débits compacts pour la ligne de résumé
+    # 1.5M, 98G : tailles compactes pour la ligne de résumé
     value = float(num or 0)
     for unit in ['', 'K', 'M', 'G', 'T']:
         if value < 1024 or unit == 'T':
@@ -314,9 +315,24 @@ def short_size(num):
         value /= 1024
 
 
+def gt_size(num):
+    # compteurs en Go / To : 850G, 44.0T
+    value = float(num or 0) / BYTES_PER_GB
+    return f"{value / 1024:.1f}T" if value >= 1024 else f"{value:.0f}G"
+
+
+def top_flop(torrents):
+    """Torrents terminés le plus et le moins rentables (ratio), ou (None, None)."""
+    finished = [t for t in torrents if is_done(t)]
+    if not finished:
+        return None, None
+    key = lambda t: ratio_key(t)[0]
+    return max(finished, key=key), min(finished, key=key)
+
+
 def build_status_line():
-    # machine1 31/10 14:01 DL 3/3 (87% 45% 20%) +1 att | v1.5M ^2.0M | libre 98G dispo 42G | r1.58 285t | RAS
-    head = f"{MACHINE} {datetime.now().strftime('%d/%m %H:%M')}"
+    # DL 3/3 (87% 45% 20%) +1 att | libre 98G dispo 42G | env 44.0T rec 28.0T r1.57
+    #   | top 6.95 Some.Movie.2022 | flop 0.07 Other.Movie.20 | RAS
     torrents = STATUS['torrents']
 
     if STATUS['error'] or torrents is None:
@@ -324,7 +340,7 @@ def build_status_line():
             free = f"libre {short_size(shutil.disk_usage(SPACE_CHECK_PATH).free)}"
         except OSError:
             free = "libre ?"
-        line = f"{head} {free} | ERREUR {STATUS['error'] or 'inconnue'}"
+        line = f"{free} | ERREUR {STATUS['error'] or 'inconnue'}"
     else:
         # téléchargements : nombre / maximum, avancement du plus avancé au moins avancé, ajouts pas encore pris
         downloading = sorted((t for t in torrents if t.get('status') in DOWNLOADING_STATUS),
@@ -336,8 +352,9 @@ def build_status_line():
         waiting = len(waiting_pending(torrents))
         att = f" +{waiting} att" if waiting else ""
 
-        stats = STATUS['stats'] or {}
-        speed = f"v{short_size(stats.get('downloadSpeed'))} ^{short_size(stats.get('uploadSpeed'))}"
+        # compteurs depuis toujours : envoyé, reçu, ratio
+        up, down = global_totals()
+        totals = f"env {gt_size(up)} rec {gt_size(down)} " + (f"r{up / down:.2f}" if down else "r-")
 
         # dispo = place pour un ajout sans passer sous MIN_FREE_GB ; manque = à libérer par la rotation
         try:
@@ -348,20 +365,30 @@ def build_status_line():
             space = "libre ?"
 
         errors = sum(1 for t in torrents if t.get('error'))
-        count = f"{len(torrents)}t" + (f" {errors}err" if errors else "")
+        err = f" {errors}err" if errors else ""
 
         rotated = [f"-{STATUS['rotated']} rotation"] if STATUS['rotated'] else []
         actions = ', '.join(rotated + STATUS['actions']) or 'RAS'
         if STATUS['dry_run']:
             actions = f"[sim] {actions}"
 
-        # trop long : on retire d'abord les détails (pourcentages, puis débits) avant de couper les actions
-        variants = [
-            f"{head} {dl}{f' ({percents})' if percents else ''}{att} | {speed} | {space} | {global_ratio()} {count} | {actions}",
-            f"{head} {dl}{att} | {speed} | {space} | {global_ratio()} {count} | {actions}",
-            f"{head} {dl}{att} | {space} | {global_ratio()} {count} | {actions}",
-        ]
-        line = next((v for v in variants if len(to_ascii(v)) <= STATUS_MAX_LEN), variants[-1])
+        # torrents terminés le plus et le moins rentables
+        top, flop = top_flop(torrents)
+
+        def ranked(width):
+            if top is None:
+                return ""
+            if not width:
+                return f" | top {human_ratio(top.get('uploadRatio'))} flop {human_ratio(flop.get('uploadRatio'))}"
+            return (f" | top {human_ratio(top.get('uploadRatio'))} {(top.get('name') or '?')[:width].rstrip()}"
+                    f" | flop {human_ratio(flop.get('uploadRatio'))} {(flop.get('name') or '?')[:width].rstrip()}")
+
+        # trop long : on retire d'abord les pourcentages, puis on raccourcit les noms top/flop,
+        # puis on les enlève, avant de couper les actions
+        dl_full = f"{dl}{f' ({percents})' if percents else ''}{att}"
+        variants = [(dl_full, 16), (f"{dl}{att}", 16), (f"{dl}{att}", 12), (f"{dl}{att}", 8), (f"{dl}{att}", 0)]
+        lines = [f"{d} | {space} | {totals}{err}{ranked(w)} | {actions}" for d, w in variants]
+        line = next((v for v in lines if len(to_ascii(v)) <= STATUS_MAX_LEN), lines[-1])
 
     line = to_ascii(line)
     if len(line) > STATUS_MAX_LEN:
@@ -1256,7 +1283,7 @@ def add_torrents(trans, torrents, slots, room, dry_run):
         if room['simulated']:
             # place libérée seulement en simulation : ajouter dépasserait MIN_FREE_GB
             print(f"[DRY-RUN] ajout de {c['name'][:60]} non fait : place libérée seulement en simulation")
-            note(f"+{c.get('name', '')[:28]} (apres rotation)")
+            note(f"+{c.get('name', '')[:22]} (apres rotation)")
             break
 
         print(f"Trouvé: {c['name'][:60]} ({c['size'] / BYTES_PER_GB:.1f}G, {c['seeders']} seeders)")
@@ -1265,7 +1292,7 @@ def add_torrents(trans, torrents, slots, room, dry_run):
             note("echec telechargement .torrent")
             return 1
 
-        note(f"+{c.get('name', '')[:28]}")
+        note(f"+{c.get('name', '')[:22]}")
         added += 1
         room['budget'] -= c['size']
 
