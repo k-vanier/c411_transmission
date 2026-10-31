@@ -282,7 +282,7 @@ def ensure_dirs():
 # RÉSUMÉ UNE LIGNE (STATUS_FILE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-STATUS = {'torrents': None, 'stats': None, 'actions': [], 'error': None, 'dry_run': False}
+STATUS = {'torrents': None, 'stats': None, 'actions': [], 'rotated': 0, 'error': None, 'dry_run': False}
 
 
 def note(action):
@@ -305,25 +305,63 @@ def global_ratio():
     return f"r{up / down:.2f}" if down else "r-"
 
 
+def short_size(num):
+    # 1.5M, 98G : tailles et débits compacts pour la ligne de résumé
+    value = float(num or 0)
+    for unit in ['', 'K', 'M', 'G', 'T']:
+        if value < 1024 or unit == 'T':
+            return f"{value:.1f}{unit}" if unit and value < 10 else f"{value:.0f}{unit}"
+        value /= 1024
+
+
 def build_status_line():
+    # machine1 31/10 14:01 DL 3/3 (87% 45% 20%) +1 att | v1.5M ^2.0M | libre 98G dispo 42G | r1.58 285t | RAS
     head = f"{MACHINE} {datetime.now().strftime('%d/%m %H:%M')}"
-
-    try:
-        free = f"libre {shutil.disk_usage(SPACE_CHECK_PATH).free / BYTES_PER_GB:.0f}G"
-    except OSError:
-        free = "libre ?"
-
     torrents = STATUS['torrents']
+
     if STATUS['error'] or torrents is None:
+        try:
+            free = f"libre {short_size(shutil.disk_usage(SPACE_CHECK_PATH).free)}"
+        except OSError:
+            free = "libre ?"
         line = f"{head} {free} | ERREUR {STATUS['error'] or 'inconnue'}"
     else:
-        dl = sum(1 for t in torrents if t.get('status') in DOWNLOADING_STATUS)
-        seed = sum(1 for t in torrents if t.get('status') in (5, 6))
-        stop = sum(1 for t in torrents if t.get('status') == 0)
-        actions = ', '.join(STATUS['actions']) or 'RAS'
+        # téléchargements : nombre / maximum, avancement du plus avancé au moins avancé, ajouts pas encore pris
+        downloading = sorted((t for t in torrents if t.get('status') in DOWNLOADING_STATUS),
+                             key=lambda t: t.get('percentDone') or 0, reverse=True)
+        dl = f"DL {len(downloading)}"
+        if ADD_POLICY == 'max_downloads':
+            dl += f"/{MAX_DOWNLOADS}"
+        percents = ' '.join(f"{(t.get('percentDone') or 0) * 100:.0f}%" for t in downloading[:4])
+        waiting = len(waiting_pending(torrents))
+        att = f" +{waiting} att" if waiting else ""
+
+        stats = STATUS['stats'] or {}
+        speed = f"v{short_size(stats.get('downloadSpeed'))} ^{short_size(stats.get('uploadSpeed'))}"
+
+        # dispo = place pour un ajout sans passer sous MIN_FREE_GB ; manque = à libérer par la rotation
+        try:
+            free, _, budget = projected_space(torrents)
+            room = f"dispo {short_size(budget)}" if budget >= 0 else f"manque {short_size(-budget)}"
+            space = f"libre {short_size(free)} {room}"
+        except OSError:
+            space = "libre ?"
+
+        errors = sum(1 for t in torrents if t.get('error'))
+        count = f"{len(torrents)}t" + (f" {errors}err" if errors else "")
+
+        rotated = [f"-{STATUS['rotated']} rotation"] if STATUS['rotated'] else []
+        actions = ', '.join(rotated + STATUS['actions']) or 'RAS'
         if STATUS['dry_run']:
             actions = f"[sim] {actions}"
-        line = f"{head} {len(torrents)}t {dl}dl {seed}seed {stop}stop {global_ratio()} {free} | {actions}"
+
+        # trop long : on retire d'abord les détails (pourcentages, puis débits) avant de couper les actions
+        variants = [
+            f"{head} {dl}{f' ({percents})' if percents else ''}{att} | {speed} | {space} | {global_ratio()} {count} | {actions}",
+            f"{head} {dl}{att} | {speed} | {space} | {global_ratio()} {count} | {actions}",
+            f"{head} {dl}{att} | {space} | {global_ratio()} {count} | {actions}",
+        ]
+        line = next((v for v in variants if len(to_ascii(v)) <= STATUS_MAX_LEN), variants[-1])
 
     line = to_ascii(line)
     if len(line) > STATUS_MAX_LEN:
@@ -968,18 +1006,20 @@ def remove_victim(trans, victim, dry_run):
 +--------------------------------------------------+
 """)
 
-    note(f"-ratio {human_ratio(victim.get('uploadRatio'))} {(victim.get('name') or 'N/A')[:28]}")
-
     if dry_run:
         print(">> DRY-RUN: aucun torrent supprimé")
+        STATUS['rotated'] += 1
         return False
 
     try:
         trans.remove([victim])
     except Exception as e:
         print(f"ERREUR suppression: {e}", file=sys.stderr)
-        STATUS['actions'][-1] = "echec suppression"
+        note("echec suppression")
         return None
+
+    # le résumé compte les suppressions de rotation (-N rotation), le détail reste dans le log
+    STATUS['rotated'] += 1
 
     print(f">> REUSSI : torrent {tid} + fichiers supprimés, {(victim.get('totalSize') or 0) / BYTES_PER_GB:.1f} GB libérés")
     return True
@@ -1078,7 +1118,7 @@ def free_slots(torrents):
         slots = max(0, MAX_DOWNLOADS - active)
         print(f"\033[1;33m>> Téléchargements en cours : {active}/{MAX_DOWNLOADS}, places libres : {slots}\033[0m")
         if not slots:
-            note(f"{active}/{MAX_DOWNLOADS} DL")
+            note("DL complet")
         return slots
 
     if active:
@@ -1088,18 +1128,23 @@ def free_slots(torrents):
     return 1
 
 
+def projected_space(torrents):
+    """(libre, reste à télécharger, budget) en octets ; budget = libre - reste - MIN_FREE_GB.
+    Lève OSError si SPACE_CHECK_PATH est illisible."""
+    free = shutil.disk_usage(SPACE_CHECK_PATH).free
+    left = sum(t.get('leftUntilDone') or 0 for t in torrents if not is_done(t))
+    left += sum(p.get('size') or 0 for p in waiting_pending(torrents))
+    return free, left, free - left - MIN_FREE_GB * BYTES_PER_GB
+
+
 def space_budget(torrents):
     """Octets qu'on peut encore engager sans passer sous MIN_FREE_GB une fois
     tous les téléchargements terminés : libre - reste à télécharger - minimum."""
     try:
-        free = shutil.disk_usage(SPACE_CHECK_PATH).free
+        free, left, budget = projected_space(torrents)
     except OSError as e:
         print(f"Erreur espace disque sur {SPACE_CHECK_PATH}: {e}", file=sys.stderr)
         return 0
-
-    left = sum(t.get('leftUntilDone') or 0 for t in torrents if not is_done(t))
-    left += sum(p.get('size') or 0 for p in waiting_pending(torrents))
-    budget = free - left - MIN_FREE_GB * BYTES_PER_GB
 
     print(f">> Libre {free / BYTES_PER_GB:.1f} GB - reste à télécharger {left / BYTES_PER_GB:.1f} GB"
           f" - minimum {MIN_FREE_GB} GB = disponible pour ajout {budget / BYTES_PER_GB:.1f} GB")
